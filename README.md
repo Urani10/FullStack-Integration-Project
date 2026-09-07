@@ -13,7 +13,7 @@
 6. [Quickstart / Running the Project](#-quickstart--running-the-project)
 7. [Environment Variables](#-environment-variables)
 8. [Automated Testing](#-automated-testing)
-9. [Live Review & Interview Preparation](#-live-review--interview-preparation)
+9. [Key Design & Engineering Decisions](#-key-design--engineering-decisions)
 10. [Known Limitations](#-known-limitations)
 
 ---
@@ -197,44 +197,40 @@ npm test
 
 ---
 
-## 🎓 Live Review & Interview Preparation (Page 8 Drill Answers)
+## 💡 Key Design & Engineering Decisions
 
-Be prepared to answer these assessment questions during the live code review:
+### 1. Server-Side Aggregation vs. Direct Client Calls
+* **Security & Credential Protection:** API keys and rate limits are managed safely server-side and never exposed to the browser.
+* **Performance & Clean Payloads:** The backend aggregates and normalizes multiple providers concurrently, delivering a unified domain payload to the client.
+* **Offline & Failure Resilience:** When third-party providers experience downtime, the backend serves persisted historical data with a `STALE` status indicator instead of failing client requests.
+* **CORS Compatibility:** Consolidating requests through Express bypasses browser CORS restrictions on external APIs.
 
-### Q1: Why did you store external data instead of always calling every provider from the browser?
-* **Answer:**
-  1. **Security:** API keys and rate limits are managed safely server-side, never exposed to client-side reverse engineering.
-  2. **Performance & Reliability:** The backend aggregates and normalizes multiple providers concurrently, returning a single clean payload to the client.
-  3. **Offline & Resilience:** If external providers experience downtime, the dashboard serves persisted historical data with a `STALE` badge rather than blanking out.
-  4. **CORS:** Many public APIs do not support direct client-side cross-origin browser requests.
+### 2. Boundary Enforcement & Canonical Schemas
+Provider-specific field names stop existing inside `backend/src/connectors/`. Functions like `normalizeWeatherPayload()` and `normalizeAirQualityPayload()` act as translation boundaries. Once raw data leaves the connector, the rest of the application (services, controllers, database models, and frontend UI) deals strictly with our internal canonical fields (`temperatureC`, `aqi`, `category`).
 
-### Q2: Where do provider-specific field names stop existing in your architecture?
-* **Answer:** Inside `backend/src/connectors/`. Functions like `normalizeWeatherPayload()` and `normalizeAirQualityPayload()` act as translation boundaries. Once raw data leaves the connector, the rest of the application (services, controllers, database models, and frontend UI) deals strictly with our internal canonical fields (`temperatureC`, `aqi`, `category`).
+### 3. Data Freshness Tracking
+We record dual timestamps on every subdocument:
+* `observedAt`: Provider observation timestamp indicating when the station took the reading.
+* `fetchedAt`: Server sync timestamp indicating when our backend queried the provider.
+* `syncState.[provider].lastSuccess`: Tracks the exact time of the last successful synchronization, allowing the UI to highlight stale data if the last sync exceeds expected freshness thresholds.
 
-### Q3: How do you know whether displayed data is fresh?
-* **Answer:** We record two separate timestamps on every subdocument:
-  - `observedAt`: When the external weather station or satellite took the reading.
-  - `fetchedAt`: When our server polled the provider.
-  - In addition, `syncState.weather.lastSuccess` tracks the exact time of the last successful sync, allowing the UI to highlight stale data if the last sync exceeds a threshold.
+### 4. Timeout & Partial Failure Isolation
+* **Network Timeouts:** External HTTP requests are capped at 5,000ms (`EXTERNAL_REQUEST_TIMEOUT_MS`) to prevent hung requests.
+* **Non-blocking Execution:** Parallel provider queries are executed with `Promise.allSettled()`, ensuring the failure of one provider does not interrupt or fail the other.
+* **Graceful Degradation:** A failing provider is marked `STALE` (if prior data exists) or `FAILED`, allowing the dashboard to render active metrics alongside localized source indicators.
 
-### Q4: What happens if one provider is slow or unavailable?
-* **Answer:**
-  - **Timeout:** If the provider does not respond within 5,000ms (`EXTERNAL_REQUEST_TIMEOUT_MS`), Axios aborts the request.
-  - **Isolation:** Because we use `Promise.allSettled`, the failure of one provider does not reject or interrupt the other.
-  - **State update:** The failed provider is marked `STALE` (if older data exists) or `FAILED`, and the dashboard renders the active provider's data alongside a clear error badge.
+### 5. Data Modeling & Storage Strategy
+A single unified `locations` collection with embedded subdocuments (`weather`, `environment`, `syncState`) was selected:
+* The dashboard consistently presents location, weather, and air quality together. Embedding enables atomic single-document reads without expensive relational `$lookup` joins, while maintaining clear document boundaries.
 
-### Q5: Which MongoDB documents/collections did you choose, and why?
-* **Answer:** We selected a single cohesive `locations` collection containing embedded subdocuments (`weather`, `environment`, `syncState`).
-  - *Why not separate collections?* The dashboard always presents location, weather, and air quality together. Embedding enables atomic single-document reads without expensive relational `$lookup` joins, while maintaining clear document boundaries.
+### 6. Scalability Architecture (100,000+ Locations)
+To scale beyond a small-scale dashboard:
+* **Background Worker Queue:** Transition from synchronous UI syncs to a distributed task queue (e.g. BullMQ / Redis) with worker pools and rate-limiting.
+* **Database Write Optimization:** Batch database writes using `bulkWrite` and shard MongoDB on `location.country` or geospatial coordinates.
+* **Cursor Pagination:** Replace full-list queries with cursor-based pagination and UI virtualization.
 
-### Q6: What would become a problem first if this went from 10 locations to 100,000?
-* **Answer:**
-  1. **Rate Limiting & Network Bottlenecks:** Syncing 100,000 locations synchronously would overwhelm external APIs and exhaust server sockets. We would need a background job queue (e.g. BullMQ / Redis) with worker pools and rate-limiting.
-  2. **Database Write Contention:** Concurrent bulk updates would require batching (`bulkWrite`) and sharding on `location.country` or geographical hash.
-  3. **Dashboard Pagination:** The frontend would need cursor-based pagination and virtualization instead of fetching all documents at once.
-
-### Q7: Which part of the code would you trust least without tests?
-* **Answer:** The connector payload mappers and error handlers. External APIs can change schemas, deprecate fields, or return unexpected null values. Without automated payload mapping tests and failure isolation tests, a minor upstream change could silently crash the synchronization engine.
+### 7. Testing Strategy & Resilience Guardrails
+Automated tests focus heavily on connector payload mappers and error handlers. External APIs can modify payloads, deprecate fields, or return nulls. Mapping tests and failure isolation tests protect the application boundary against unexpected schema changes.
 
 ---
 
